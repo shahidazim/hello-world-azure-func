@@ -1,0 +1,129 @@
+parameters:
+  - name: serviceConnection
+    type: string
+
+  - name: subscriptionId
+    type: string
+
+  - name: resourceGroup
+    type: string
+    default: ''
+
+  - name: nameFilter
+    type: string
+    default: ''
+
+stages:
+- stage: ZAP_Security_Scan
+  displayName: "ZAP DAST Security Scan"
+  jobs:
+  - job: Discover_And_Scan
+    displayName: "Discover Azure Function Apps and Run ZAP"
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+
+    # =============================
+    # Login and discover apps
+    # =============================
+    - task: AzureCLI@2
+      displayName: "Discover Function Apps"
+      inputs:
+        azureSubscription: ${{ parameters.serviceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az account set --subscription ${{ parameters.subscriptionId }}
+
+          if [ -z "${{ parameters.resourceGroup }}" ]; then
+            apps=$(az functionapp list --query "[].defaultHostName" -o tsv)
+          else
+            apps=$(az functionapp list -g ${{ parameters.resourceGroup }} --query "[].defaultHostName" -o tsv)
+          fi
+
+          if [ ! -z "${{ parameters.nameFilter }}" ]; then
+            apps=$(echo "$apps" | grep "${{ parameters.nameFilter }}")
+          fi
+
+          echo "$apps" > functionapps.txt
+
+    # =========================================
+    # Run ZAP Baseline Scan and generate XML
+    # =========================================
+    - script: |
+        mkdir -p zap-reports
+        chmod 777 zap-reports
+
+        while read app; do
+          echo "Scanning https://$app"
+
+          docker run --rm \
+            --user root \
+            -v $(pwd)/zap-reports:/zap/wrk \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t https://$app \
+              -j \
+              -J ${app}.json || true
+
+        done < functionapps.txt
+      displayName: "Run ZAP Baseline Scan"
+
+    - script: |
+        python3 <<EOF
+        import json
+        import glob
+        import xml.etree.ElementTree as ET
+        import os
+
+        for file in glob.glob("zap-reports/*.json"):
+            with open(file) as f:
+                data = json.load(f)
+
+            testsuite = ET.Element("testsuite", name="ZAP Scan")
+            total = 0
+            failures = 0
+
+            for site in data.get("site", []):
+                for alert in site.get("alerts", []):
+                    total += 1
+                    testcase = ET.SubElement(
+                        testsuite,
+                        "testcase",
+                        classname=site.get("name", "ZAP"),
+                        name=alert.get("alert", "Unknown Alert")
+                    )
+
+                    severity = alert.get("riskdesc", "")
+                    if "High" in severity or "Medium" in severity:
+                        failures += 1
+                        failure = ET.SubElement(
+                            testcase,
+                            "failure",
+                            message=severity
+                        )
+                        failure.text = alert.get("desc", "")
+
+            testsuite.set("tests", str(total))
+            testsuite.set("failures", str(failures))
+
+            xml_file = file.replace(".json", ".xml")
+
+            tree = ET.ElementTree(testsuite)
+            with open(xml_file, "wb") as f:
+                tree.write(f, encoding="utf-8", xml_declaration=True)
+
+            print(f"Created JUnit report: {xml_file}")
+
+        EOF
+      displayName: "Convert ZAP JSON to JUnit"
+
+    # =============================
+    # Publish test results
+    # =============================
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'zap-reports/*.xml'
+        failTaskOnFailedTests: false
