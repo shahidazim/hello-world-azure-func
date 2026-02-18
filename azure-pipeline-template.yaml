@@ -73,8 +73,6 @@ stages:
     # =============================
     # Publish SARIF to Security Tab
     # =============================
-    - task: PublishSecurityAnalysisLogs@3
-      displayName: "Publish ZAP Results to Security Tab"
+    - task: AdvancedSecurity-Publish@1
       inputs:
-        ArtifactName: 'CodeAnalysisLogs'
         SarifFile: 'zap-reports/*.sarif.json'
