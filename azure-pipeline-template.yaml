@@ -75,4 +75,4 @@ stages:
     # =============================
     - task: AdvancedSecurity-Publish@1
       inputs:
-        SarifFile: 'zap-reports/*.sarif.json'
+        SarifsInputDirectory: 'zap-reports/'
